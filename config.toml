@@ -1,0 +1,7 @@
+[hotkeys]
+hold_to_record = "ctrl+alt"
+start_recording_toggle = "alt+scroll_lock"
+stop_recording_toggle = "alt+num_lock"
+
+[settings]
+model = "base.en" 
