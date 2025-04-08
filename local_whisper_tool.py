@@ -10,6 +10,21 @@ import time
 import argparse
 import logging
 import warnings
+import requests
+import io
+from scipy.io.wavfile import write as write_wav
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import sys
+import os
+import subprocess
+import sqlite3
+import uuid
+import datetime
+import platform
+import getpass
+import traceback
+import json
 
 # --- Model Choices and Descriptions ---
 MODEL_CHOICES = [
@@ -17,13 +32,12 @@ MODEL_CHOICES = [
     'base.en', 'base',
     'small.en', 'small',
     'medium.en', 'medium',
-    'large-v1', 'large-v2', 'large-v3', 'large' # large-v versions might be specific
+    'large-v1', 'large-v2', 'large-v3', 'large'
 ]
 
 MODEL_HELP = f"""
-Choose the Whisper model to use. Models range from 'tiny' (fastest, lowest accuracy, low resource usage) 
-to 'large' (slowest, highest accuracy, high resource usage). 
-The '.en' suffix indicates English-only models, which are often faster and more accurate for English speech.
+Choose the Whisper model to use when running in local mode. Models range from 'tiny' (fastest, lowest accuracy) 
+to 'large' (slowest, highest accuracy). The '.en' suffix indicates English-only models.
 Choices: {MODEL_CHOICES}
 (Default: value from config.toml)
 """
@@ -37,22 +51,19 @@ def debug_print(*args, **kwargs):
         print(*args, **kwargs)
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Local Whisper Transcription Tool')
-parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
-parser.add_argument(
-    '-m', '--model',
-    type=str,
-    choices=MODEL_CHOICES,
-    help=MODEL_HELP,
-    metavar='MODEL_NAME' # Shows MODEL_NAME instead of the full choices list in brief help
-)
+parser = argparse.ArgumentParser(description='Whisper Transcription Tool')
+parser.add_argument('--local', action='store_true', help='Run Whisper model locally instead of sending to server')
+parser.add_argument('--gui', action='store_true', help='Show GUI interface instead of using hotkeys')
+parser.add_argument('--server-url', type=str, default='http://localhost:5001/transcribe', help='URL of the transcription server')
+parser.add_argument('--model', type=str, default='base.en', help='Whisper model to use in local mode')
+parser.add_argument('--no-sound', action='store_true', help='Disable all sound feedback')
+parser.add_argument('--debug', action='store_true', help='Enable debug logging')
 args = parser.parse_args()
 
 # Set global debug flag based on command line argument
 DEBUG_ENABLED = args.debug
 
 # Configure logging
-# Default level is CRITICAL (effectively off) unless --debug is passed
 log_level = logging.DEBUG if args.debug else logging.CRITICAL
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
 logging.basicConfig(level=log_level, format=log_format)
@@ -61,25 +72,38 @@ logging.basicConfig(level=log_level, format=log_format)
 logging.info("Loading configuration from config.toml...")
 with open("config.toml", "r") as f:
     config = toml.load(f)
-# Get default model from config
-model_name_config = config["settings"]["model"]
-logging.info(f"Model specified in config.toml: {model_name_config}")
 
-# Determine the final model name (CLI overrides config)
-model_name = model_name_config
-if args.model:
-    model_name = args.model
-    logging.info(f"Overriding model with command-line argument: {model_name}")
+# --- Model Loading (Conditional) ---
+model = None
+model_name = None
+if args.local:
+    # Determine the final model name (CLI overrides config)
+    model_name_config = config["settings"]["model"]
+    logging.info(f"Model specified in config.toml: {model_name_config}")
+    model_name = model_name_config
+    if args.model:
+        model_name = args.model
+        logging.info(f"Overriding model with command-line argument: {model_name}")
+    else:
+        logging.info(f"Using model from config.toml: {model_name}")
+
+    # Load Whisper model, suppressing the FP16 warning
+    logging.info(f"Loading Whisper model '{model_name}'... (This may take a moment)")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*")
+        model = whisper.load_model(model_name)
+    logging.info("Whisper model loaded.")
+elif args.model:
+    # Warn if -m is specified without --local
+    print("Warning: --model argument ignored because --local flag is not set. Using server mode.")
+    logging.warning("--model argument provided but --local is not set. Defaulting to server mode.")
+
+# Print mode
+if args.local:
+    print(f"\n--- Running in LOCAL mode (Model: {model_name}) ---")
 else:
-    logging.info(f"Using model from config.toml: {model_name}")
-
-# Load Whisper model, suppressing the FP16 warning
-logging.info(f"Loading Whisper model '{model_name}'... (This may take a moment)")
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", UserWarning)
-    warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*")
-    model = whisper.load_model(model_name)
-logging.info("Whisper model loaded.")
+    print(f"\n--- Running in CLIENT mode (Server: {args.server_url}) ---")
 
 # Print configured hotkeys using print()
 print("\nConfigured Hotkeys:")
@@ -91,13 +115,61 @@ print("\nPress Ctrl+C to exit.")
 recording_lock = threading.Lock()
 recording_thread = None
 stop_event = threading.Event()
-command_queue = queue.Queue(maxsize=10)  # Limit queue size to prevent buildup
+command_queue = queue.Queue(maxsize=10)
 current_pressed_keys = set()
-key_lock = threading.Lock()  # Add lock for key state synchronization
+key_lock = threading.Lock()
+audio_data_queue = queue.Queue()
 
 # --- State flags managed by control thread ---
 _is_recording_internal = False
 _hold_key_active_internal = False
+
+# Sound feedback functions
+def play_sound(sound_name):
+    """Play a sound file if sound is enabled and the file exists."""
+    if args.no_sound:
+        return
+    
+    sound_path = os.path.join('sounds', sound_name)
+    if os.path.exists(sound_path):
+        try:
+            # Use aplay for Linux, afplay for Mac, or start for Windows
+            if sys.platform == 'linux':
+                subprocess.Popen(['aplay', sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif sys.platform == 'darwin':  # macOS
+                subprocess.Popen(['afplay', sound_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:  # Windows
+                subprocess.Popen(['start', sound_path], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            logging.warning(f"Could not play sound {sound_name}: {e}")
+
+def generate_tone(frequency, duration, volume=0.5):
+    """Generate a simple sine wave tone."""
+    try:
+        sample_rate = 44100
+        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        tone = np.sin(frequency * t * 2 * np.pi)
+        audio = tone * (2**15 - 1) * volume
+        return audio.astype(np.int16)
+    except Exception as e:
+        logging.warning(f"Error generating tone: {e}")
+        return None
+
+def play_tone(frequency, duration=0.1, volume=0.5):
+    """Play a tone with the given frequency and duration."""
+    try:
+        audio = generate_tone(frequency, duration, volume)
+        if audio is not None:
+            play_obj = sa.play_buffer(audio, 1, 2, 44100)
+            play_obj.wait_done()
+    except Exception as e:
+        logging.warning(f"Could not play audio feedback: {e}")
+        # Continue execution even if audio fails
+
+# Constants for different tones
+START_TONE = 880  # A5
+STOP_TONE = 440   # A4
+DONE_TONE = 660   # E5
 
 def parse_hotkey(hotkey_string):
     """Parses a hotkey string like 'ctrl+shift+r' into pynput components."""
@@ -213,7 +285,7 @@ def check_hotkey(target_name):
 # Function to start recording (now only contains the audio loop)
 def start_recording():
     global audio_data_queue, stop_event, _is_recording_internal
-
+    play_sound('start.wav')
     audio_data_queue = queue.Queue()
     samplerate = 16000
     chunk_duration_ms = 100
@@ -248,12 +320,92 @@ def start_recording():
             except:
                 pass
 
-# Function to process audio (no changes needed here conceptually)
+def get_system_info():
+    """Get system and user information for metrics."""
+    try:
+        return {
+            'hostname': platform.node(),
+            'username': getpass.getuser(),
+            'system': platform.system(),
+            'release': platform.release(),
+            'version': platform.version(),
+            'machine': platform.machine(),
+            'processor': platform.processor()
+        }
+    except Exception as e:
+        logging.error(f"Error getting system info: {e}")
+        return {}
+
+def send_audio_to_server(audio_data_fp32, samplerate, server_url):
+    """Sends audio data to the transcription server."""
+    logging.info(f"Sending audio data to server: {server_url}")
+    
+    start_time = time.time()
+    try:
+        # Create WAV in memory
+        wav_bytes = io.BytesIO()
+        write_wav(wav_bytes, samplerate, audio_data_fp32)
+        wav_bytes.seek(0) # Rewind buffer to the beginning
+        
+        # Get system info for metrics
+        system_info = get_system_info()
+        
+        files = {'audio': ('audio.wav', wav_bytes, 'audio/wav')}
+        data = {
+            'system_info': json.dumps(system_info),  # Convert to JSON string
+            'start_time': start_time,
+            'mode': 'server'  # Indicate this is a server transcription request
+        }
+        
+        # Set a long timeout (e.g., 5 minutes = 300 seconds)
+        timeout_seconds = 300 
+        
+        response = requests.post(server_url, files=files, data=data, timeout=timeout_seconds)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+        result_json = response.json()
+        duration = time.time() - start_time
+        
+        if "transcription" in result_json:
+            transcription = result_json["transcription"].strip()
+            logging.info(f"Server transcription successful in {duration:.1f}s")
+            return transcription
+        elif "error" in result_json:
+            error_msg = result_json["error"]
+            logging.error(f"Server returned an error: {error_msg}")
+            print(f"ERROR: Server transcription failed: {error_msg}")
+            return None
+        else:
+            logging.error("Server response did not contain 'transcription' or 'error' key.")
+            print("ERROR: Received unexpected response format from server.")
+            return None
+
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Connection Error: Could not connect to server at {server_url}. {e}")
+        print(f"ERROR: Cannot connect to server at {server_url}. Is it running?")
+        return None
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout Error: Request to server timed out after {timeout_seconds}s.")
+        print(f"ERROR: Request to server timed out ({timeout_seconds}s).")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request Error: An error occurred sending data to the server: {e}")
+        print(f"ERROR: Failed to communicate with server: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error sending/receiving data: {e}")
+        print(f"ERROR: An unexpected error occurred during server communication: {e}")
+        return None
+    finally:
+        if 'wav_bytes' in locals():
+            wav_bytes.close() # Clean up BytesIO buffer
+
 def _process_stopped_audio():
-    global audio_data_queue, model
+    global audio_data_queue, model, args
     
     debug_print("DEBUG - _process_stopped_audio started.")
-    logging.info("Processing audio...")
+    logging.info("Processing recorded audio...")
+    play_sound('stop.wav')
 
     audio_chunks = []
     while not audio_data_queue.empty():
@@ -264,7 +416,8 @@ def _process_stopped_audio():
     
     if not audio_chunks:
         logging.warning("No audio data captured.")
-        print("=== TRANSCRIPTION SKIPPED - No audio ===")
+        print("=== TRANSCRIPTION SKIPPED - No audio data ===")
+        play_sound('error.wav')
         return
 
     try:
@@ -272,25 +425,77 @@ def _process_stopped_audio():
         audio_fp32 = audio_np.flatten().astype(np.float32)
     except ValueError as e:
         logging.error(f"Error concatenating audio chunks: {e}")
-        print("=== TRANSCRIPTION FAILED - Data error ===")
+        print(f"=== TRANSCRIPTION FAILED - Audio data processing error === ({e})")
+        play_sound('error.wav')
         return
-
-    try:
-        start_time = time.time()
-        result = model.transcribe(audio_fp32, fp16=False)
-        transcription = result["text"].strip()
-        duration = time.time() - start_time
     except Exception as e:
-        logging.error(f"Error during transcription: {e}")
-        print("=== TRANSCRIPTION FAILED - Whisper error ===")
+        logging.error(f"Unexpected error processing audio chunks: {e}")
+        print(f"=== TRANSCRIPTION FAILED - Unexpected audio processing error === ({e})")
+        play_sound('error.wav')
         return
 
+    transcription = None
+    duration = 0
+    start_time = time.time()
+    
+    if args.local:
+        # --- LOCAL TRANSCRIPTION ---
+        logging.info("Performing local transcription...")
+        print("--- Transcribing locally... ---")
+        if model is None:
+            print("ERROR: Local model was not loaded successfully. Cannot transcribe locally.")
+            logging.error("Attempted local transcription, but model is None.")
+            play_sound('error.wav')
+            return
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*")
+                result = model.transcribe(audio_fp32, fp16=False)
+            transcription = result["text"].strip()
+            duration = time.time() - start_time
+            logging.info(f"Local transcription successful in {duration:.1f}s")
+            print(f"--- Local transcription finished ({duration:.1f}s) ---")
+        except Exception as e:
+            logging.error(f"Error during local Whisper transcription: {e}")
+            print(f"=== LOCAL TRANSCRIPTION FAILED - Whisper error: {e} ===")
+            play_sound('error.wav')
+            return
+            
+    else:
+        # --- SERVER TRANSCRIPTION ---
+        print("--- Sending audio to server... ---")
+        transcription = send_audio_to_server(audio_fp32, 16000, args.server_url)
+        duration = time.time() - start_time
+
+    # --- Post-processing ---
     if transcription:
-        pyperclip.copy(transcription)
-        print(f"Transcription: {transcription}")
-        print(f"Copied to clipboard - Transcribed in {duration:.1f}s")
+        if not transcription.strip():  # Check if transcription is empty after stripping whitespace
+            print("=== TRANSCRIPTION SKIPPED - Empty result ===")
+            logging.warning("Transcription result was empty after stripping whitespace.")
+            play_sound('error.wav')
+            return
+            
+        try:
+            pyperclip.copy(transcription)
+            print(f"Transcription: {transcription}")
+            print(f"Copied to clipboard. (Processed in {duration:.1f}s)")
+            logging.info(f"Transcription successful and copied to clipboard.")
+            play_sound('done.wav')
+        except Exception as e:
+            logging.error(f"Could not copy transcription to clipboard: {e}")
+            print(f"Transcription: {transcription}")
+            print(f"(Could not copy to clipboard: {e})")
+            play_sound('error.wav')
+    elif transcription is None:
+        print("=== TRANSCRIPTION FAILED (See errors above) ===")
+        logging.warning("Transcription result was None.")
+        play_sound('error.wav')
     else:
         print("=== TRANSCRIPTION SKIPPED - Empty result ===")
+        logging.info("Transcription result was empty.")
+        play_sound('error.wav')
 
     logging.info("Processing thread finished.")
     debug_print("DEBUG - _process_stopped_audio finished.")
@@ -403,44 +608,337 @@ def control_thread_func():
 
     debug_print("DEBUG - Control thread finished.")
 
-
-# --- Main Execution --- 
-
-# Start the keyboard listener in a separate thread
-print("Starting keyboard listener...")
-listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-listener.daemon = True # Allow main thread to exit even if listener is active
-listener.start()
-print("Listener started.")
-
-# Start the control thread
-control_thread = threading.Thread(target=control_thread_func)
-control_thread.daemon = True # Allow main thread to exit
-control_thread.start()
-
-# Keep the main thread alive, handle Ctrl+C
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("\nCtrl+C detected. Cleaning up...")
+class WhisperGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Whisper Transcription Tool")
+        self.root.geometry("600x400")
+        self.root.minsize(500, 350)
+        
+        # Set theme and style
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Configure styles
+        style.configure('TFrame', background='#f0f0f0')
+        style.configure('TLabel', background='#f0f0f0', font=('Segoe UI', 10))
+        style.configure('TButton', font=('Segoe UI', 12, 'bold'), padding=15)
+        style.configure('Status.TLabel', font=('Segoe UI', 10, 'bold'))
+        style.configure('Mode.TLabel', font=('Segoe UI', 9), foreground='#666666')
+        style.configure('Clipboard.TLabel', font=('Segoe UI', 12, 'bold'))
+        style.configure('LogTitle.TLabel', font=('Segoe UI', 11, 'bold'))
+        
+        # Create custom button styles with different colors
+        style.configure('Start.TButton', background='#4CAF50', foreground='white')
+        style.configure('Stop.TButton', background='#f44336', foreground='white')
+        style.configure('Clear.TButton', background='#2196F3', foreground='white')
+        style.configure('Exit.TButton', background='#FF9800', foreground='white')
+        
+        # Create main frame with padding
+        main_frame = ttk.Frame(root, padding="15")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights for resizing
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(2, weight=1)
+        main_frame.columnconfigure(3, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+        
+        # Status label
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, style='Status.TLabel')
+        self.status_label.grid(row=0, column=0, columnspan=4, pady=(0, 10))
+        
+        # Clipboard status label
+        self.clipboard_status_var = tk.StringVar(value="")
+        self.clipboard_status = ttk.Label(
+            main_frame, 
+            textvariable=self.clipboard_status_var, 
+            style='Clipboard.TLabel',
+            foreground='green'
+        )
+        self.clipboard_status.grid(row=1, column=0, columnspan=4, pady=(0, 10))
+        
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=2, column=0, columnspan=4, pady=(0, 10))
+        
+        # Left column frame for recording buttons
+        left_frame = ttk.Frame(button_frame)
+        left_frame.grid(row=0, column=0, padx=5)
+        
+        # Right column frame for utility buttons
+        right_frame = ttk.Frame(button_frame)
+        right_frame.grid(row=0, column=1, padx=5)
+        
+        # Recording buttons in left column
+        self.record_button = ttk.Button(
+            left_frame, 
+            text="Start Recording", 
+            command=self.start_recording,
+            style='Start.TButton',
+            width=20
+        )
+        self.record_button.grid(row=0, column=0, pady=5)
+        
+        self.stop_button = ttk.Button(
+            left_frame, 
+            text="Stop Recording", 
+            command=self.stop_recording, 
+            state=tk.DISABLED,
+            style='Stop.TButton',
+            width=20
+        )
+        self.stop_button.grid(row=1, column=0, pady=5)
+        
+        # Utility buttons in right column
+        self.clear_button = ttk.Button(
+            right_frame, 
+            text="Clear Log", 
+            command=self.clear_text,
+            style='Clear.TButton',
+            width=20
+        )
+        self.clear_button.grid(row=0, column=0, pady=5)
+        
+        self.exit_button = ttk.Button(
+            right_frame,
+            text="Exit",
+            command=self.on_closing,
+            style='Exit.TButton',
+            width=20
+        )
+        self.exit_button.grid(row=1, column=0, pady=5)
+        
+        # Transcription log title
+        log_title = ttk.Label(
+            main_frame,
+            text="Transcription Log",
+            style='LogTitle.TLabel'
+        )
+        log_title.grid(row=3, column=0, columnspan=4, pady=(0, 5), sticky=tk.W)
+        
+        # Transcription text area
+        self.text_area = scrolledtext.ScrolledText(
+            main_frame, 
+            wrap=tk.WORD, 
+            width=50,
+            height=8,
+            font=('Segoe UI', 10),
+            padx=10,
+            pady=10
+        )
+        self.text_area.grid(row=4, column=0, columnspan=4, pady=(0, 10), sticky=(tk.W, tk.E, tk.N))
+        
+        # Mode label
+        mode_text = f"Local ({model_name})" if args.local else "Server"
+        mode_label = ttk.Label(
+            main_frame, 
+            text=f"Mode: {mode_text}",
+            style='Mode.TLabel'
+        )
+        mode_label.grid(row=5, column=0, columnspan=4)
+        
+        # Bind window close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Start the control thread
+        self.control_thread = threading.Thread(target=self.control_thread_func, daemon=True)
+        self.control_thread.start()
+        
+        # Set focus to the window
+        self.root.focus_force()
     
-    # Signal all threads to stop
-    command_queue.put('EXIT')
+    def start_recording(self):
+        self.record_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.status_var.set("Recording...")
+        self.clipboard_status_var.set("")
+        play_sound('start.wav')
+        command_queue.put('START_TOGGLE', block=False)
     
-    # Give threads a moment to clean up
-    time.sleep(0.5)
+    def stop_recording(self):
+        self.record_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_var.set("Processing...")
+        play_sound('stop.wav')
+        command_queue.put('STOP_TOGGLE', block=False)
     
-    # Stop the keyboard listener
-    if listener.is_alive():
-        listener.stop()
+    def clear_text(self):
+        self.text_area.delete(1.0, tk.END)
     
-    # Wait for control thread to finish (with timeout)
-    if control_thread.is_alive():
-        control_thread.join(timeout=1.0)
+    def append_text(self, text):
+        self.text_area.insert(tk.END, text + "\n")
+        self.text_area.see(tk.END)
+    
+    def control_thread_func(self):
+        global _is_recording_internal, _hold_key_active_internal
+        
+        while True:
+            try:
+                command = command_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            
+            if command == 'START_TOGGLE':
+                if not _is_recording_internal:
+                    _is_recording_internal = True
+                    _hold_key_active_internal = False
+                    stop_event.clear()
+                    recording_thread = threading.Thread(target=start_recording)
+                    recording_thread.start()
+            
+            elif command == 'STOP_TOGGLE':
+                if _is_recording_internal and not _hold_key_active_internal:
+                    stop_event.set()
+                    _is_recording_internal = False
+                    processing_thread = threading.Thread(target=self.process_audio)
+                    processing_thread.start()
+            
+            elif command == 'EXIT':
+                if _is_recording_internal:
+                    stop_event.set()
+                    _is_recording_internal = False
+                break
+    
+    def process_audio(self):
+        global audio_data_queue, model, args
+        
+        audio_chunks = []
+        while not audio_data_queue.empty():
+            try:
+                audio_chunks.append(audio_data_queue.get_nowait())
+            except queue.Empty:
+                break
+        
+        if not audio_chunks:
+            message = "=== TRANSCRIPTION SKIPPED - No audio data ==="
+            print(message)
+            self.append_text(message)
+            play_sound('error.wav')
+            return
+        
+        try:
+            audio_np = np.concatenate(audio_chunks, axis=0)
+            audio_fp32 = audio_np.flatten().astype(np.float32)
+        except Exception as e:
+            message = f"=== TRANSCRIPTION FAILED - Audio processing error: {e} ==="
+            print(message)
+            self.append_text(message)
+            play_sound('error.wav')
+            return
+        
+        start_time = time.time()
+        if args.local:
+            if model is None:
+                message = "ERROR: Local model was not loaded successfully."
+                print(message)
+                self.append_text(message)
+                play_sound('error.wav')
+                return
+            
+            try:
+                self.status_var.set("Transcribing locally...")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    warnings.filterwarnings("ignore", message=".*FP16 is not supported on CPU.*")
+                    result = model.transcribe(audio_fp32, fp16=False)
+                transcription = result["text"].strip()
+                duration = time.time() - start_time
+                
+                if not transcription:  # Check if transcription is empty
+                    message = "=== TRANSCRIPTION SKIPPED - Empty result ==="
+                    print(message)
+                    self.append_text(message)
+                    play_sound('error.wav')
+                    return
+                    
+                message = f"Transcription ({duration:.1f}s): {transcription}"
+                print(message)
+                self.append_text(message)
+                try:
+                    pyperclip.copy(transcription)
+                    preview = transcription[:30] + "..." if len(transcription) > 30 else transcription
+                    self.clipboard_status_var.set(f"✓ Copied to clipboard ({duration:.1f}s): {preview}")
+                    play_sound('done.wav')
+                except Exception as e:
+                    self.clipboard_status_var.set("⚠ Failed to copy to clipboard")
+                    play_sound('error.wav')
+            except Exception as e:
+                message = f"=== LOCAL TRANSCRIPTION FAILED - Whisper error: {e} ==="
+                print(message)
+                self.append_text(message)
+                play_sound('error.wav')
+        else:
+            self.status_var.set("Sending to server...")
+            transcription = send_audio_to_server(audio_fp32, 16000, args.server_url)
+            duration = time.time() - start_time
+            if transcription:
+                if not transcription.strip():  # Check if transcription is empty
+                    message = "=== TRANSCRIPTION SKIPPED - Empty result ==="
+                    print(message)
+                    self.append_text(message)
+                    play_sound('error.wav')
+                    return
+                    
+                message = f"Transcription ({duration:.1f}s): {transcription}"
+                print(message)
+                self.append_text(message)
+                try:
+                    pyperclip.copy(transcription)
+                    preview = transcription[:30] + "..." if len(transcription) > 30 else transcription
+                    self.clipboard_status_var.set(f"✓ Copied to clipboard ({duration:.1f}s): {preview}")
+                    play_sound('done.wav')
+                except Exception as e:
+                    self.clipboard_status_var.set("⚠ Failed to copy to clipboard")
+                    play_sound('error.wav')
+            else:
+                message = "=== TRANSCRIPTION FAILED - Server returned no transcription ==="
+                print(message)
+                self.append_text(message)
+                play_sound('error.wav')
+        
+        self.status_var.set("Ready")
+    
+    def on_closing(self):
+        command_queue.put('EXIT', block=False)
+        self.root.destroy()
+        sys.exit(0)
+
+# --- Main Execution ---
+if args.gui:
+    root = tk.Tk()
+    app = WhisperGUI(root)
+    root.mainloop()
+else:
+    # Start the keyboard listener in a separate thread
+    print("Starting keyboard listener...")
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.daemon = True
+    listener.start()
+    print("Listener started.")
+
+    # Start the control thread
+    control_thread = threading.Thread(target=control_thread_func)
+    control_thread.daemon = True
+    control_thread.start()
+
+    # Keep the main thread alive, handle Ctrl+C
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected. Cleaning up...")
+        command_queue.put('EXIT')
+        time.sleep(0.5)
+        if listener.is_alive():
+            listener.stop()
         if control_thread.is_alive():
-            print("Warning: Control thread did not exit cleanly")
-    
+            control_thread.join(timeout=1.0)
+
     # If recording is active, wait for it to stop
     if recording_thread and recording_thread.is_alive():
         recording_thread.join(timeout=1.0)

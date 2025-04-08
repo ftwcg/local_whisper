@@ -3,3 +3,7 @@ sounddevice
 pynput
 pyperclip
 toml 
+Flask 
+requests 
+scipy 
+simpleaudio 
